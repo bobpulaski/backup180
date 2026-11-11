@@ -1,13 +1,14 @@
 //! Scheduler — triggers backup jobs according to their cron-like schedule.
 //! Each job runs in its own tokio task (parallel execution supported).
 
+use crate::backup_engine::run_backup;
 use crate::config::{AppConfig, BackupJob, Schedule};
 use crate::errors::{AppError, AppResult};
-use crate::backup_engine::run_backup;
-use chrono::{Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone, Timelike};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 
 /// Shared scheduler state.
 pub struct Scheduler {
@@ -20,47 +21,71 @@ impl Scheduler {
     }
 
     /// Compute the next run time (Local) for a schedule, relative to now.
-    fn next_run(schedule: &Schedule, now: chrono::DateTime<Local>) -> Option<chrono::DateTime<Local>> {
+    fn next_run(
+        schedule: &Schedule,
+        now: chrono::DateTime<Local>,
+    ) -> Option<chrono::DateTime<Local>> {
         match schedule {
             Schedule::EveryMinutes { minutes } => {
-                let interval = Duration::from_secs(*minutes * 60);
-                Some((now + chrono::Duration::from_std(interval).unwrap()).into())
+                let interval = Duration::from_secs(minutes.saturating_mul(60).max(1));
+                Some(now + chrono::Duration::from_std(interval).ok()?)
             }
             Schedule::Hourly { minute } => {
-                let mut next = now.date_naive().and_hms_opt(now.hour(), *minute, 0).unwrap();
+                let mut next = now
+                    .date_naive()
+                    .and_hms_opt(now.hour(), *minute, 0)
+                    .unwrap_or_else(|| now.naive_local());
                 if next <= now.naive_local() {
-                    next = (next + chrono::Duration::hours(1)).naive_local();
+                    next += chrono::Duration::hours(1);
                 }
                 Local.from_local_datetime(&next).single()
             }
             Schedule::Daily { hour, minute } => {
-                let mut next = now.date_naive().and_hms_opt(*hour, *minute, 0).unwrap();
+                let mut next = now
+                    .date_naive()
+                    .and_hms_opt(*hour, *minute, 0)
+                    .unwrap_or_else(|| now.naive_local());
                 if next <= now.naive_local() {
-                    next = (next + chrono::Duration::days(1)).naive_local();
+                    next += chrono::Duration::days(1);
                 }
                 Local.from_local_datetime(&next).single()
             }
-            Schedule::Weekly { weekday, hour, minute } => {
+            Schedule::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => {
                 // weekday: 1=Mon .. 7=Sun
-                let mut next = now.date_naive();
-                while next.weekday().num_days_from_monday() + 1 != *weekday {
-                    next = next.succ_opt()?;
+                let mut date = now.date_naive();
+                while date.weekday().num_days_from_monday() + 1 != *weekday {
+                    date = date.succ_opt()?;
                 }
-                let mut dt = next.and_hms_opt(*hour, *minute, 0).unwrap();
+                let mut dt = date.and_hms_opt(*hour, *minute, 0)?;
                 if dt <= now.naive_local() {
-                    next = next.succ_opt()?;
-                    while next.weekday().num_days_from_monday() + 1 != *weekday {
-                        next = next.succ_opt()?;
+                    date = date.succ_opt()?;
+                    while date.weekday().num_days_from_monday() + 1 != *weekday {
+                        date = date.succ_opt()?;
                     }
-                    dt = next.and_hms_opt(*hour, *minute, 0).unwrap();
+                    dt = date.and_hms_opt(*hour, *minute, 0)?;
                 }
                 Local.from_local_datetime(&dt).single()
             }
             Schedule::Cron { expression } => {
-                // Parse cron expression (5 fields: min hour dom mon dow)
-                let sched = cron::Schedule::from_str(expression).ok()?;
-                let after: chrono::DateTime<chrono::Utc> = now.into();
-                sched.upcoming(chrono::Utc).next().map(|dt| dt.with_timezone(&Local))
+                // The `cron` crate expects 6 or 7 fields (with seconds).
+                // Accept a standard 5-field expression by prepending a seconds field.
+                let expr = {
+                    let fields = expression.split_whitespace().count();
+                    if fields == 5 {
+                        format!("0 {}", expression)
+                    } else {
+                        expression.clone()
+                    }
+                };
+                let sched = cron::Schedule::from_str(&expr).ok()?;
+                sched
+                    .upcoming(Local)
+                    .next()
+                    .map(|dt| dt.with_timezone(&Local))
             }
         }
     }
@@ -72,25 +97,25 @@ impl Scheduler {
         if duration.num_seconds() <= 0 {
             Some(Duration::from_secs(1))
         } else {
-            chrono::Duration::to_std(duration).ok()
+            chrono::Duration::to_std(&duration).ok()
         }
     }
 
     /// Spawn scheduler tasks for every enabled job with a schedule.
     pub async fn spawn_jobs(&self, app_handle: tauri::AppHandle) -> AppResult<()> {
-        let config = self.config.read().await;
-        let jobs: Vec<BackupJob> = config
-            .jobs
-            .iter()
-            .filter(|j| j.enabled && j.schedule.is_some())
-            .cloned()
-            .collect();
-        drop(config);
+        let jobs: Vec<BackupJob> = {
+            let config = self.config.read().await;
+            config
+                .jobs
+                .iter()
+                .filter(|j| j.enabled && j.schedule.is_some())
+                .cloned()
+                .collect()
+        };
 
         for job in jobs {
             let config_clone = Arc::clone(&self.config);
             let handle = app_handle.clone();
-            let job_id = job.id.clone();
             let job_name = job.name.clone();
 
             tokio::spawn(async move {
@@ -115,25 +140,28 @@ impl Scheduler {
                 AppError::Scheduler(format!("Job {} has no schedule", job.id))
             })?;
 
-            let delay = Self::delay_until_next(schedule, now)
-                .unwrap_or_else(|| Duration::from_secs(60));
+            let delay =
+                Self::delay_until_next(schedule, now).unwrap_or_else(|| Duration::from_secs(60));
 
             sleep(delay).await;
 
-            // Run the backup synchronously inside a blocking task (file I/O).
-            let result = tokio::task::spawn_blocking(move || run_backup(&job)).await;
+            // Run the backup inside a blocking task (file I/O).
+            let job_for_run = job.clone();
+            let result = tokio::task::spawn_blocking(move || run_backup(&job_for_run)).await;
 
             match result {
                 Ok(Ok(res)) => {
                     tracing::info!(
                         "Backup '{}' completed: {} files, {} bytes",
-                        job_name, res.files_copied, res.bytes_copied
+                        job.name,
+                        res.files_copied,
+                        res.bytes_copied
                     );
                     job.last_run = Some(res.finished_at.clone());
                     job.last_status = Some(format!("ok: {} files", res.files_copied));
                 }
                 Ok(Err(e)) => {
-                    tracing::error!("Backup '{}' error: {}", job_name, e);
+                    tracing::error!("Backup '{}' error: {}", job.name, e);
                     job.last_run = Some(Local::now().to_rfc3339());
                     job.last_status = Some(format!("error: {}", e));
                 }
@@ -150,6 +178,26 @@ impl Scheduler {
                     j.last_run = job.last_run.clone();
                     j.last_status = job.last_status.clone();
                 }
+                let (kind, message) = match &job.last_status {
+                    Some(s) if s.starts_with("ok:") => (
+                        "run_ok",
+                        format!(
+                            "Задача «{}» выполнена по расписанию: {}",
+                            job.name,
+                            s.trim_start_matches("ok: ").trim()
+                        ),
+                    ),
+                    Some(s) => (
+                        "run_error",
+                        format!(
+                            "Задача «{}»: ошибка по расписанию — {}",
+                            job.name,
+                            s.trim_start_matches("error: ").trim()
+                        ),
+                    ),
+                    None => ("run_ok", format!("Задача «{}» выполнена по расписанию", job.name)),
+                };
+                crate::config::push_log(&mut cfg, kind, message);
                 if let Err(e) = crate::config::save_config(&app_handle, &cfg) {
                     tracing::error!("Failed to persist job status: {}", e);
                 }

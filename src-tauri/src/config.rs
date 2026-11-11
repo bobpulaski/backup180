@@ -1,7 +1,7 @@
 //! Application configuration (jobs, output paths, masks, schedule).
 //! Persisted to a JSON file in the Tauri config directory.
 
-use crate::errors::AppResult;
+use crate::errors::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::Manager;
@@ -15,6 +15,35 @@ pub struct AppConfig {
     pub jobs: Vec<BackupJob>,
     pub autostart: bool,
     pub tray_enabled: bool,
+    #[serde(default)]
+    pub logs: Vec<LogEntry>,
+}
+
+/// Maximum number of log entries kept in the config.
+pub const MAX_LOG_ENTRIES: usize = 1000;
+
+/// A single journal record (task created/deleted/updated or a run result).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: String,
+    pub timestamp: String,
+    /// One of: created | updated | deleted | run_ok | run_error.
+    pub kind: String,
+    pub message: String,
+}
+
+/// Append a log entry, trimming the oldest ones beyond the cap.
+pub fn push_log(config: &mut AppConfig, kind: &str, message: String) {
+    config.logs.push(LogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Local::now().to_rfc3339(),
+        kind: kind.to_string(),
+        message,
+    });
+    if config.logs.len() > MAX_LOG_ENTRIES {
+        let excess = config.logs.len() - MAX_LOG_ENTRIES;
+        config.logs.drain(0..excess);
+    }
 }
 
 /// A single backup task defined by the user.
@@ -30,6 +59,9 @@ pub struct BackupJob {
     pub enabled: bool,
     pub last_run: Option<String>,
     pub last_status: Option<String>,
+    /// Optional single-level grouping folder. `None` = ungrouped (top level).
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl Default for BackupJob {
@@ -45,12 +77,14 @@ impl Default for BackupJob {
             enabled: false,
             last_run: None,
             last_status: None,
+            group: None,
         }
     }
 }
 
 /// Cron-like schedule for a backup job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Schedule {
     /// Run every N minutes.
     EveryMinutes { minutes: u64 },
@@ -58,9 +92,13 @@ pub enum Schedule {
     Hourly { minute: u32 },
     /// Run daily at HH:MM.
     Daily { hour: u32, minute: u32 },
-    /// Run weekly on a weekday at HH:MM.
-    Weekly { weekday: u32, hour: u32, minute: u32 },
-    /// Raw cron expression (5-field).
+    /// Run weekly on a weekday at HH:MM (1=Mon .. 7=Sun).
+    Weekly {
+        weekday: u32,
+        hour: u32,
+        minute: u32,
+    },
+    /// Raw cron expression (seconds optional, 5 or 6 fields).
     Cron { expression: String },
 }
 
@@ -73,9 +111,9 @@ impl Default for Schedule {
 /// Load configuration from the Tauri config dir.
 pub fn load_config(app_handle: &tauri::AppHandle) -> AppResult<AppConfig> {
     let config_dir = app_handle
-        .path_resolver()
+        .path()
         .app_config_dir()
-        .ok_or_else(|| AppError::Config("Cannot resolve app config dir".into()))?;
+        .map_err(|e| AppError::Config(format!("Cannot resolve app config dir: {e}")))?;
     std::fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join(CONFIG_FILE_NAME);
@@ -85,6 +123,7 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppResult<AppConfig> {
             jobs: Vec::new(),
             autostart: false,
             tray_enabled: true,
+            logs: Vec::new(),
         };
         save_config(app_handle, &default)?;
         return Ok(default);
@@ -98,9 +137,9 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppResult<AppConfig> {
 /// Save configuration to disk.
 pub fn save_config(app_handle: &tauri::AppHandle, config: &AppConfig) -> AppResult<()> {
     let config_dir = app_handle
-        .path_resolver()
+        .path()
         .app_config_dir()
-        .ok_or_else(|| AppError::Config("Cannot resolve app config dir".into()))?;
+        .map_err(|e| AppError::Config(format!("Cannot resolve app config dir: {e}")))?;
     std::fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join(CONFIG_FILE_NAME);
@@ -109,11 +148,12 @@ pub fn save_config(app_handle: &tauri::AppHandle, config: &AppConfig) -> AppResu
     Ok(())
 }
 
-/// Resolve the data directory for backup output (user documents by default).
+/// Resolve the default output directory (user documents, fallback home).
 pub fn default_output_dir(app_handle: &tauri::AppHandle) -> AppResult<PathBuf> {
-    let dirs = app_handle.path_resolver();
-    Ok(dirs
+    let resolver = app_handle.path();
+    let base = resolver
         .document_dir()
-        .unwrap_or_else(|| dirs.home_dir().unwrap_or_else(PathBuf::new))
-        .join("Backup180"))
+        .or_else(|_| resolver.home_dir())
+        .map_err(|e| AppError::Config(format!("Cannot resolve output dir: {e}")))?;
+    Ok(base.join("Backup180"))
 }

@@ -4,24 +4,27 @@ version = "0.1.0"
 edition = "2021"
 description = "Tauri desktop backup utility with scheduling, masks and tray"
 
+[lib]
+name = "backup180_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
 [dependencies]
-tauri = { version = "2", features = ["api-all"] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-log = "2"
 tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 walkdir = "2"
 glob = "0.3"
-cron = "0.19"
+cron = "0.12"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 anyhow = "1"
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
-[profile.release]
-opt-level = 3
+tracing = "0.1"

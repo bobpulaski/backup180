@@ -2,32 +2,31 @@
 //! Each command is callable from JS via `invoke`.
 
 use crate::{
+    autostart::{disable_autostart, enable_autostart, is_autostart_enabled},
     backup_engine::run_backup,
-    config::{load_config, save_config, AppConfig, BackupJob, Schedule},
-    errors::AppResult,
+    config::{push_log, save_config, AppConfig, BackupJob, LogEntry, Schedule},
+    errors::{AppError, AppResult},
     scheduler::Scheduler,
-    autostart::{enable_autostart, disable_autostart, is_autostart_enabled},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
-use tauri::api::dialog::FileDialogBuilder;
+use tauri_plugin_dialog::DialogExt;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
-    pub config: tokio::sync::RwLock<AppConfig>,
+    pub config: Arc<tokio::sync::RwLock<AppConfig>>,
     pub scheduler: tokio::sync::Mutex<Option<Scheduler>>,
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         Self {
-            config: tokio::sync::RwLock::new(config),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
             scheduler: tokio::sync::Mutex::new(None),
         }
     }
@@ -49,6 +48,7 @@ pub struct JobDto {
     pub enabled: bool,
     pub last_run: Option<String>,
     pub last_status: Option<String>,
+    pub group: Option<String>,
 }
 
 impl From<&BackupJob> for JobDto {
@@ -56,14 +56,22 @@ impl From<&BackupJob> for JobDto {
         Self {
             id: job.id.clone(),
             name: job.name.clone(),
-            source_paths: job.source_paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            source_paths: job
+                .source_paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
             output_path: job.output_path.to_string_lossy().to_string(),
             include_masks: job.include_masks.clone(),
             exclude_masks: job.exclude_masks.clone(),
-            schedule: job.schedule.as_ref().map(|s| serde_json::to_value(s).unwrap_or_default()),
+            schedule: job
+                .schedule
+                .as_ref()
+                .map(|s| serde_json::to_value(s).unwrap_or_default()),
             enabled: job.enabled,
             last_run: job.last_run.clone(),
             last_status: job.last_status.clone(),
+            group: job.group.clone(),
         }
     }
 }
@@ -78,6 +86,8 @@ pub struct SaveJobPayload {
     pub exclude_masks: Vec<String>,
     pub schedule: Option<serde_json::Value>,
     pub enabled: bool,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +99,25 @@ pub struct BackupRunResult {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogDto {
+    pub id: String,
+    pub timestamp: String,
+    pub kind: String,
+    pub message: String,
+}
+
+impl From<&LogEntry> for LogDto {
+    fn from(entry: &LogEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            timestamp: entry.timestamp.clone(),
+            kind: entry.kind.clone(),
+            message: entry.message.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,14 +133,30 @@ pub async fn load_jobs(state: State<'_, AppState>) -> AppResult<Vec<JobDto>> {
 
 /// Save (create or update) a backup job.
 #[tauri::command]
-pub async fn save_job(state: State<'_, AppState>, app: AppHandle, payload: SaveJobPayload) -> AppResult<JobDto> {
+pub async fn save_job(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    payload: SaveJobPayload,
+) -> AppResult<JobDto> {
     let mut config = state.config.write().await;
 
-    let id = payload.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let id = payload
+        .id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let schedule = payload.schedule.map(|v| serde_json::from_value::<Schedule>(v))
+    let schedule = payload
+        .schedule
+        .map(serde_json::from_value::<Schedule>)
         .transpose()
         .map_err(|e| AppError::Config(format!("Invalid schedule: {}", e)))?;
+
+    // Preserve last-run metadata when updating an existing job.
+    let (last_run, last_status) = config
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .map(|j| (j.last_run.clone(), j.last_status.clone()))
+        .unwrap_or((None, None));
 
     let job = BackupJob {
         id,
@@ -122,14 +167,28 @@ pub async fn save_job(state: State<'_, AppState>, app: AppHandle, payload: SaveJ
         exclude_masks: payload.exclude_masks,
         schedule,
         enabled: payload.enabled,
-        last_run: None,
-        last_status: None,
+        last_run,
+        last_status,
+        group: payload
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty()),
     };
 
     if let Some(pos) = config.jobs.iter().position(|j| j.id == job.id) {
         config.jobs[pos] = job.clone();
+        push_log(
+            &mut config,
+            "updated",
+            format!("Задача «{}» изменена", job.name),
+        );
     } else {
         config.jobs.push(job.clone());
+        push_log(
+            &mut config,
+            "created",
+            format!("Задача «{}» создана", job.name),
+        );
     }
 
     save_config(&app, &config)?;
@@ -140,7 +199,14 @@ pub async fn save_job(state: State<'_, AppState>, app: AppHandle, payload: SaveJ
 #[tauri::command]
 pub async fn delete_job(state: State<'_, AppState>, app: AppHandle, id: String) -> AppResult<()> {
     let mut config = state.config.write().await;
+    let name = config
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .map(|j| j.name.clone())
+        .unwrap_or_else(|| id.clone());
     config.jobs.retain(|j| j.id != id);
+    push_log(&mut config, "deleted", format!("Задача «{}» удалена", name));
     save_config(&app, &config)?;
     Ok(())
 }
@@ -152,19 +218,89 @@ pub async fn get_job(state: State<'_, AppState>, id: String) -> AppResult<Option
     Ok(config.jobs.iter().find(|j| j.id == id).map(JobDto::from))
 }
 
+/// Load the journal entries, newest first.
+#[tauri::command]
+pub async fn load_logs(state: State<'_, AppState>) -> AppResult<Vec<LogDto>> {
+    let config = state.config.read().await;
+    let mut logs: Vec<LogDto> = config.logs.iter().map(LogDto::from).collect();
+    logs.reverse();
+    Ok(logs)
+}
+
+/// Clear the journal.
+#[tauri::command]
+pub async fn clear_logs(state: State<'_, AppState>, app: AppHandle) -> AppResult<()> {
+    let mut config = state.config.write().await;
+    config.logs.clear();
+    save_config(&app, &config)?;
+    Ok(())
+}
+
 /// Manually run a backup job.
 #[tauri::command]
-pub async fn run_backup_job(state: State<'_, AppState>, id: String) -> AppResult<BackupRunResult> {
-    let config = state.config.read().await;
-    let job = config
-        .jobs
-        .iter()
-        .find(|j| j.id == id)
-        .cloned()
-        .ok_or_else(|| AppError::Config(format!("Job {} not found", id)))?;
-    drop(config);
+pub async fn run_backup_job(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> AppResult<BackupRunResult> {
+    let job = {
+        let config = state.config.read().await;
+        config
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Config(format!("Job {} not found", id)))?
+    };
 
-    let result = tokio::task::spawn_blocking(move || run_backup(&job))??;
+    let job_for_run = job.clone();
+    let finished = tokio::task::spawn_blocking(move || run_backup(&job_for_run)).await;
+
+    let result = match finished {
+        Ok(Ok(res)) => {
+            persist_status(
+                &app,
+                &state.config,
+                &id,
+                Some(res.finished_at.clone()),
+                Some(format!("ok: {} files", res.files_copied)),
+                "run_ok",
+                format!(
+                    "Задача «{}» выполнена: {} файлов, {} байт",
+                    res.job_name, res.files_copied, res.bytes_copied
+                ),
+            )
+            .await;
+            res
+        }
+        Ok(Err(e)) => {
+            persist_status(
+                &app,
+                &state.config,
+                &id,
+                Some(chrono::Local::now().to_rfc3339()),
+                Some(format!("error: {}", e)),
+                "run_error",
+                format!("Задача «{}»: ошибка — {}", job.name, e),
+            )
+            .await;
+            return Err(e);
+        }
+        Err(e) => {
+            persist_status(
+                &app,
+                &state.config,
+                &id,
+                Some(chrono::Local::now().to_rfc3339()),
+                Some("error: task join failed".into()),
+                "run_error",
+                format!("Задача «{}»: ошибка запуска задачи", job.name),
+            )
+            .await;
+            return Err(AppError::from(e));
+        }
+    };
+
     Ok(BackupRunResult {
         job_id: result.job_id,
         job_name: result.job_name,
@@ -176,75 +312,70 @@ pub async fn run_backup_job(state: State<'_, AppState>, id: String) -> AppResult
     })
 }
 
+/// Persist a job's last-run metadata into the shared config and on disk.
+async fn persist_status(
+    app: &AppHandle,
+    config: &Arc<tokio::sync::RwLock<AppConfig>>,
+    id: &str,
+    last_run: Option<String>,
+    last_status: Option<String>,
+    log_kind: &str,
+    log_message: String,
+) {
+    let mut cfg = config.write().await;
+    if let Some(j) = cfg.jobs.iter_mut().find(|j| j.id == id) {
+        j.last_run = last_run;
+        j.last_status = last_status;
+    }
+    push_log(&mut cfg, log_kind, log_message);
+    if let Err(e) = save_config(app, &cfg) {
+        tracing::error!("Failed to persist job status: {}", e);
+    }
+}
+
 /// Open a folder picker dialog and return the selected path.
 #[tauri::command]
-pub async fn select_folder(_app: AppHandle) -> AppResult<Option<String>> {
-    let (tx, rx) = mpsc::channel();
-
-    FileDialogBuilder::new()
-        .select_folder(move |path| {
-            let _ = tx.send(path.map(|p| p.to_string_lossy().to_string()));
-        });
-
-    let result = rx.recv_timeout(std::time::Duration::from_secs(300));
-    match result {
-        Ok(p) => Ok(p),
-        Err(_) => Err(AppError::Config("Folder dialog timed out".into())),
-    }
+pub async fn select_folder(app: AppHandle) -> AppResult<Option<String>> {
+    Ok(app
+        .dialog()
+        .file()
+        .blocking_pick_folder()
+        .map(|p| p.to_string()))
 }
 
 /// Open a file picker dialog and return the selected path.
 #[tauri::command]
-pub async fn select_file(_app: AppHandle) -> AppResult<Option<String>> {
-    let (tx, rx) = mpsc::channel();
-
-    FileDialogBuilder::new()
-        .select_file(move |path| {
-            let _ = tx.send(path.map(|p| p.to_string_lossy().to_string()));
-        });
-
-    let result = rx.recv_timeout(std::time::Duration::from_secs(300));
-    match result {
-        Ok(p) => Ok(p),
-        Err(_) => Err(AppError::Config("File dialog timed out".into())),
-    }
+pub async fn select_file(app: AppHandle) -> AppResult<Option<String>> {
+    Ok(app
+        .dialog()
+        .file()
+        .blocking_pick_file()
+        .map(|p| p.to_string()))
 }
 
-/// Save a folder picker dialog (output destination) and return the selected path.
+/// Open a folder picker dialog (used to choose an output destination).
 #[tauri::command]
-pub async fn save_folder(_app: AppHandle) -> AppResult<Option<String>> {
-    let (tx, rx) = mpsc::channel();
-
-    FileDialogBuilder::new()
-        .save_file(move |path| {
-            let _ = tx.send(path.map(|p| p.to_string_lossy().to_string()));
-        });
-
-    let result = rx.recv_timeout(std::time::Duration::from_secs(300));
-    match result {
-        Ok(p) => Ok(p),
-        Err(_) => Err(AppError::Config("Save dialog timed out".into())),
-    }
+pub async fn save_folder(app: AppHandle) -> AppResult<Option<String>> {
+    Ok(app
+        .dialog()
+        .file()
+        .blocking_pick_folder()
+        .map(|p| p.to_string()))
 }
 
 /// Get autostart status.
 #[tauri::command]
-pub async fn get_autostart() -> AppResult<bool> {
-    is_autostart_enabled()
+pub async fn get_autostart(app: AppHandle) -> AppResult<bool> {
+    is_autostart_enabled(&app)
 }
 
 /// Set autostart enabled/disabled.
 #[tauri::command]
-pub async fn set_autostart(enabled: bool, app: AppHandle) -> AppResult<()> {
-    let exe_path = app
-        .path_resolver()
-        .exe_path()
-        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("")));
-
+pub async fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
     if enabled {
-        enable_autostart(&exe_path)?;
+        enable_autostart(&app)?;
     } else {
-        disable_autostart()?;
+        disable_autostart(&app)?;
     }
     Ok(())
 }
@@ -263,7 +394,7 @@ pub async fn open_main_window(app: AppHandle) -> AppResult<()> {
 #[tauri::command]
 pub async fn reload_scheduler(state: State<'_, AppState>, app: AppHandle) -> AppResult<()> {
     let scheduler = Scheduler::new(Arc::clone(&state.config));
-    scheduler.spawn_jobs(app.clone())?;
+    scheduler.spawn_jobs(app.clone()).await?;
     let mut sched_guard = state.scheduler.lock().await;
     *sched_guard = Some(scheduler);
     Ok(())

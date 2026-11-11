@@ -4,7 +4,7 @@ use crate::config::BackupJob;
 use crate::errors::{AppError, AppResult};
 use glob::Pattern;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::WalkDir;
 
 /// Result of a single backup run.
@@ -19,32 +19,68 @@ pub struct BackupResult {
     pub errors: Vec<String>,
 }
 
-/// Check whether a path matches any include mask (and is not excluded).
-fn path_matches(path: &Path, job: &BackupJob) -> bool {
-    let rel_str = path.to_string_lossy();
+/// Normalize a path to a forward-slash string (glob crate uses `/`).
+fn to_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// True if `name` (or optional relative path) matches the mask.
+fn mask_matches(mask: &str, file_name: &str, rel_slash: &str) -> bool {
+    match Pattern::new(mask) {
+        Ok(pat) => pat.matches(file_name) || pat.matches(rel_slash),
+        Err(_) => false,
+    }
+}
+
+/// Decide whether a file should be copied, using include/exclude masks.
+/// Masks are tested against the file name and the path relative to the source root.
+fn file_matches(path: &Path, source_root: &Path, job: &BackupJob) -> bool {
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let rel_slash = path
+        .strip_prefix(source_root)
+        .map(to_slash)
+        .unwrap_or_else(|_| to_slash(path));
 
     // Exclude masks take precedence.
     for excl in &job.exclude_masks {
-        if let Ok(pat) = Pattern::new(excl) {
-            if pat.matches(&rel_str) {
-                return false;
-            }
+        if mask_matches(excl, &file_name, &rel_slash) {
+            return false;
         }
     }
 
     // If include masks are defined, at least one must match.
     if !job.include_masks.is_empty() {
-        for incl in &job.include_masks {
-            if let Ok(pat) = Pattern::new(incl) {
-                if pat.matches(&rel_str) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return job
+            .include_masks
+            .iter()
+            .any(|incl| mask_matches(incl, &file_name, &rel_slash));
     }
 
     true
+}
+
+/// Decide whether a directory should be pruned during traversal.
+/// Only exclude masks apply to directories (include masks never prune folders,
+/// otherwise `*.docx` would skip the whole tree).
+fn dir_excluded(path: &Path, source_root: &Path, job: &BackupJob) -> bool {
+    if job.exclude_masks.is_empty() {
+        return false;
+    }
+    let dir_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let rel_slash = path
+        .strip_prefix(source_root)
+        .map(to_slash)
+        .unwrap_or_else(|_| to_slash(path));
+
+    job.exclude_masks
+        .iter()
+        .any(|excl| mask_matches(excl, &dir_name, &rel_slash))
 }
 
 /// Copy a single file preserving relative structure inside output dir.
@@ -90,10 +126,12 @@ pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
             continue;
         }
 
-        // Directory: recursive walk.
+        // Directory: recursive walk. Directories are always descended into
+        // (unless explicitly excluded); include masks only filter files.
+        let root = source.clone();
         for entry in WalkDir::new(source)
             .into_iter()
-            .filter_entry(|e| path_matches(e.path(), job))
+            .filter_entry(|e| !(e.file_type().is_dir() && dir_excluded(e.path(), &root, job)))
         {
             let entry = match entry {
                 Ok(e) => e,
@@ -104,25 +142,27 @@ pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
             };
 
             let path = entry.path();
-            if path.is_file() {
-                // Compute relative path from source root.
-                let rel = match path.strip_prefix(source) {
-                    Ok(r) => r.to_path_buf(),
-                    Err(_) => path.clone(),
-                };
-                let dest = job.output_path.join(&rel);
+            if !path.is_file() {
+                continue;
+            }
 
-                if !path_matches(path, job) {
-                    continue;
-                }
+            if !file_matches(path, source, job) {
+                continue;
+            }
 
-                match copy_file(path, &dest) {
-                    Ok(size) => {
-                        files_copied += 1;
-                        bytes_copied += size;
-                    }
-                    Err(e) => errors.push(format!("Failed to copy {:?}: {}", path, e)),
+            // Compute relative path from source root.
+            let rel = match path.strip_prefix(source) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => path.to_path_buf(),
+            };
+            let dest = job.output_path.join(&rel);
+
+            match copy_file(path, &dest) {
+                Ok(size) => {
+                    files_copied += 1;
+                    bytes_copied += size;
                 }
+                Err(e) => errors.push(format!("Failed to copy {:?}: {}", path, e)),
             }
         }
     }
@@ -144,25 +184,56 @@ pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_path_matches_include_only() {
-        let job = BackupJob {
-            include_masks: vec!["*.txt".into()],
-            exclude_masks: Vec::new(),
+    fn job(include: &[&str], exclude: &[&str]) -> BackupJob {
+        BackupJob {
+            include_masks: include.iter().map(|s| s.to_string()).collect(),
+            exclude_masks: exclude.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
-        };
-        assert!(path_matches(Path::new("notes.txt"), &job));
-        assert!(!path_matches(Path::new("image.png"), &job));
+        }
     }
 
     #[test]
-    fn test_exclude_takes_precedence() {
-        let job = BackupJob {
-            include_masks: vec!["*".into()],
-            exclude_masks: vec!["*tmp*".into()],
-            ..Default::default()
-        };
-        assert!(!path_matches(Path::new("cache.tmp"), &job));
-        assert!(path_matches(Path::new("data.txt"), &job));
+    fn include_matches_bare_file_name() {
+        let j = job(&["*.docx"], &[]);
+        assert!(file_matches(Path::new("C:/src/a.docx"), Path::new("C:/src"), &j));
+        assert!(!file_matches(Path::new("C:/src/a.png"), Path::new("C:/src"), &j));
+    }
+
+    #[test]
+    fn include_matches_nested_file_name() {
+        let j = job(&["*.docx"], &[]);
+        // Old bug: nested files under directories were skipped entirely.
+        assert!(file_matches(
+            Path::new("C:/src/sub/deep/b.docx"),
+            Path::new("C:/src"),
+            &j
+        ));
+    }
+
+    #[test]
+    fn include_matches_relative_path() {
+        let j = job(&["sub/*.docx"], &[]);
+        assert!(file_matches(Path::new("C:/src/sub/b.docx"), Path::new("C:/src"), &j));
+        assert!(!file_matches(Path::new("C:/src/other/b.docx"), Path::new("C:/src"), &j));
+    }
+
+    #[test]
+    fn exclude_takes_precedence() {
+        let j = job(&["*"], &["*tmp*"]);
+        assert!(!file_matches(Path::new("C:/src/cache.tmp"), Path::new("C:/src"), &j));
+        assert!(file_matches(Path::new("C:/src/data.txt"), Path::new("C:/src"), &j));
+    }
+
+    #[test]
+    fn dir_pruned_by_exclude() {
+        let j = job(&[], &["node_modules"]);
+        assert!(dir_excluded(Path::new("C:/src/node_modules"), Path::new("C:/src"), &j));
+        assert!(!dir_excluded(Path::new("C:/src/src"), Path::new("C:/src"), &j));
+    }
+
+    #[test]
+    fn empty_masks_allow_all() {
+        let j = job(&[], &[]);
+        assert!(file_matches(Path::new("C:/src/anything.bin"), Path::new("C:/src"), &j));
     }
 }

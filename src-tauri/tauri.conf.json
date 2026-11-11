@@ -1,65 +1,18 @@
 {
-  "$schema": "https://api.tauri.app/xsd/tauri-config-2.xsd",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "Backup180",
   "version": "0.1.0",
   "identifier": "com.darts180.backup",
   "build": {
-    "frontendDist": "../../dist",
-    "devPath": "http://localhost:5173",
+    "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",
-    "loader": "esbuild"
+    "beforeBuildCommand": "npm run build"
   },
-  "package": {
-    "productName": "Backup180",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": true,
-      "fs": {
-        "readFile": true,
-        "writeFile": true,
-        "readDir": true,
-        "copyFile": true,
-        "createDir": true,
-        "removeFile": true,
-        "removeDir": true,
-        "exists": true,
-        "scope": ["$APP/*", "$HOME/*", "$DOCUMENT/*", "$DESKTOP/*", "$TEMP/*", "*"]
-      },
-      "dialog": {
-        "open": true,
-        "save": true,
-        "message": true
-      },
-      "shell": {
-        "open": true,
-        "execute": true,
-        "sidecar": true
-      },
-      "path": {
-        "all": true
-      },
-      "tray": {
-        "all": true
-      },
-      "window": {
-        "all": true
-      },
-      "notification": {
-        "all": true
-      },
-      "process": {
-        "all": true
-      },
-      "autostart": {
-        "all": true
-      }
-    },
+  "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Backup180 — Резервное копирование",
         "width": 1000,
         "height": 700,
@@ -69,35 +22,26 @@
         "fullscreen": false,
         "center": true,
         "visible": true,
-        "transparent": false,
-        "decorations": true,
-        "skipTaskbar": false,
-        "alwaysOnTop": false
+        "decorations": true
       }
     ],
     "security": {
       "csp": null
-    },
-    "bundle": {
-      "active": true,
-      "targets": ["msi", "nsis"],
-      "identifier": "com.darts180.backup",
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128x32.png",
-        "icons/icns.icns",
-        "icons/icon.ico"
-      ],
-      "resources": [],
-      "externalBin": [],
-      "copyright": "Copyright © 2026 darts180",
-      "category": "Utility",
-      "shortDescription": "File and folder backup utility with scheduling",
-      "longDescription": "Backup180 — desktop backup utility built with Tauri. Select files and folders, set include/exclude masks, configure cron schedules per task, choose output destination, and run backups manually or on a schedule. Runs from system tray with auto-start support."
-    },
-    "updater": {
-      "active": false
     }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "copyright": "Copyright © 2026 darts180",
+    "category": "Utility",
+    "shortDescription": "File and folder backup utility with scheduling",
+    "longDescription": "Backup180 — desktop backup utility built with Tauri. Select files and folders, set include/exclude masks, configure cron schedules per task, choose output destination, and run backups manually or on a schedule. Runs from system tray with auto-start support."
   }
 }
