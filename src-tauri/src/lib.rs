@@ -6,7 +6,9 @@ pub mod backup_engine;
 pub mod commands;
 pub mod config;
 pub mod errors;
+pub mod i18n;
 pub mod scheduler;
+pub mod settings;
 pub mod tray;
 
 use std::sync::Arc;
@@ -27,6 +29,17 @@ pub fn run() {
             let config = config::load_config(app.handle()).unwrap_or_default();
             let state = commands::AppState::new(config);
             app.manage(state);
+
+            // Apply the saved interface language before building the tray.
+            if let Ok(settings) = settings::load_settings(app.handle()) {
+                i18n::set_lang(i18n::Lang::from_code(&settings.language));
+            }
+
+            // Set the window title to "Backup180 — <version>" from package metadata.
+            let version = app.package_info().version.to_string();
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(&format!("Backup180 — {version}"));
+            }
 
             // Build and register the system tray.
             tray::build_tray(app.handle())?;
@@ -64,6 +77,8 @@ pub fn run() {
             commands::set_autostart,
             commands::open_main_window,
             commands::reload_scheduler,
+            commands::load_settings,
+            commands::set_language,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

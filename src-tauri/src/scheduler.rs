@@ -178,24 +178,25 @@ impl Scheduler {
                     j.last_run = job.last_run.clone();
                     j.last_status = job.last_status.clone();
                 }
+                let lang = crate::i18n::current_lang();
                 let (kind, message) = match &job.last_status {
                     Some(s) if s.starts_with("ok:") => (
                         "run_ok",
-                        format!(
-                            "Задача «{}» выполнена по расписанию: {}",
-                            job.name,
-                            s.trim_start_matches("ok: ").trim()
+                        crate::i18n::run_sched_ok(
+                            lang,
+                            &job.name,
+                            s.trim_start_matches("ok: ").trim(),
                         ),
                     ),
                     Some(s) => (
                         "run_error",
-                        format!(
-                            "Задача «{}»: ошибка по расписанию — {}",
-                            job.name,
-                            s.trim_start_matches("error: ").trim()
+                        crate::i18n::run_sched_error(
+                            lang,
+                            &job.name,
+                            s.trim_start_matches("error: ").trim(),
                         ),
                     ),
-                    None => ("run_ok", format!("Задача «{}» выполнена по расписанию", job.name)),
+                    None => ("run_ok", crate::i18n::run_sched_ok_generic(lang, &job.name)),
                 };
                 crate::config::push_log(&mut cfg, kind, message);
                 if let Err(e) = crate::config::save_config(&app_handle, &cfg) {

@@ -1,6 +1,6 @@
 // Thin wrappers over Tauri `invoke` for the backend commands.
 import { invoke } from '@tauri-apps/api/core'
-import type { BackupRunResult, Job, LogEntry, SaveJobPayload } from './types'
+import type { AppSettings, BackupRunResult, Job, LogEntry, SaveJobPayload } from './types'
 
 export const loadJobs = () => invoke<Job[]>('load_jobs')
 
@@ -30,3 +30,7 @@ export const setAutostart = (enabled: boolean) => invoke<void>('set_autostart', 
 export const openMainWindow = () => invoke<void>('open_main_window')
 
 export const reloadScheduler = () => invoke<void>('reload_scheduler')
+
+export const loadSettings = () => invoke<AppSettings>('load_settings')
+
+export const setLanguage = (language: string) => invoke<void>('set_language', { language })

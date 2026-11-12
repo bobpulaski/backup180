@@ -6,7 +6,9 @@ use crate::{
     backup_engine::run_backup,
     config::{push_log, save_config, AppConfig, BackupJob, LogEntry, Schedule},
     errors::{AppError, AppResult},
+    i18n::{self, Lang},
     scheduler::Scheduler,
+    settings::AppSettings,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -180,14 +182,14 @@ pub async fn save_job(
         push_log(
             &mut config,
             "updated",
-            format!("Задача «{}» изменена", job.name),
+            i18n::job_updated(i18n::current_lang(), &job.name),
         );
     } else {
         config.jobs.push(job.clone());
         push_log(
             &mut config,
             "created",
-            format!("Задача «{}» создана", job.name),
+            i18n::job_created(i18n::current_lang(), &job.name),
         );
     }
 
@@ -206,7 +208,11 @@ pub async fn delete_job(state: State<'_, AppState>, app: AppHandle, id: String) 
         .map(|j| j.name.clone())
         .unwrap_or_else(|| id.clone());
     config.jobs.retain(|j| j.id != id);
-    push_log(&mut config, "deleted", format!("Задача «{}» удалена", name));
+    push_log(
+        &mut config,
+        "deleted",
+        i18n::job_deleted(i18n::current_lang(), &name),
+    );
     save_config(&app, &config)?;
     Ok(())
 }
@@ -258,6 +264,7 @@ pub async fn run_backup_job(
 
     let result = match finished {
         Ok(Ok(res)) => {
+            let lang = i18n::current_lang();
             persist_status(
                 &app,
                 &state.config,
@@ -265,10 +272,7 @@ pub async fn run_backup_job(
                 Some(res.finished_at.clone()),
                 Some(format!("ok: {} files", res.files_copied)),
                 "run_ok",
-                format!(
-                    "Задача «{}» выполнена: {} файлов, {} байт",
-                    res.job_name, res.files_copied, res.bytes_copied
-                ),
+                i18n::run_manual_ok(lang, &res.job_name, res.files_copied, res.bytes_copied),
             )
             .await;
             res
@@ -281,7 +285,7 @@ pub async fn run_backup_job(
                 Some(chrono::Local::now().to_rfc3339()),
                 Some(format!("error: {}", e)),
                 "run_error",
-                format!("Задача «{}»: ошибка — {}", job.name, e),
+                i18n::run_manual_error(i18n::current_lang(), &job.name, &e.to_string()),
             )
             .await;
             return Err(e);
@@ -294,7 +298,7 @@ pub async fn run_backup_job(
                 Some(chrono::Local::now().to_rfc3339()),
                 Some("error: task join failed".into()),
                 "run_error",
-                format!("Задача «{}»: ошибка запуска задачи", job.name),
+                i18n::run_join_error(i18n::current_lang(), &job.name),
             )
             .await;
             return Err(AppError::from(e));
@@ -397,5 +401,27 @@ pub async fn reload_scheduler(state: State<'_, AppState>, app: AppHandle) -> App
     scheduler.spawn_jobs(app.clone()).await?;
     let mut sched_guard = state.scheduler.lock().await;
     *sched_guard = Some(scheduler);
+    Ok(())
+}
+
+/// Load application settings (currently the interface language).
+#[tauri::command]
+pub async fn load_settings(app: AppHandle) -> AppResult<AppSettings> {
+    crate::settings::load_settings(&app)
+}
+
+/// Change the interface language and persist it. Rebuilds the tray menu.
+#[tauri::command]
+pub async fn set_language(app: AppHandle, language: String) -> AppResult<()> {
+    let lang = Lang::from_code(&language);
+    i18n::set_lang(lang);
+
+    let mut settings = crate::settings::load_settings(&app).unwrap_or_default();
+    settings.language = lang.code().to_string();
+    crate::settings::save_settings(&app, &settings)?;
+
+    if let Err(e) = crate::tray::update_tray_language(&app, lang) {
+        tracing::error!("Failed to update tray language: {}", e);
+    }
     Ok(())
 }

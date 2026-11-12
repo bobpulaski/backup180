@@ -49,3 +49,7 @@ export interface LogEntry {
   kind: string
   message: string
 }
+
+export interface AppSettings {
+  language: string
+}

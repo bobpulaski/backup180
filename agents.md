@@ -121,3 +121,16 @@ npm run tauri build
 - Cron-выражения: 5-полевые принимаются, к ним дописывается секунда (`cron` crate).
 - Autostart делается через `tauri-plugin-autostart` (не через `winreg`).
 - Фронтенд общается через `invoke` (см. `src/api.ts`), типы — `src/types.ts`.
+
+### Локализация (ru/en)
+
+- Бэкенд: `src-tauri/src/i18n.rs` — enum `Lang { Ru, En }`, глобальный `RwLock<Lang>`
+  (`set_lang`/`current_lang`), функции всех строк трея и журнала. `src-tauri/src/settings.rs`
+  — `AppSettings { language }`, файл `settings.json` в `app_config_dir()`. В setup язык
+  ставится до `build_tray`; `tray::update_tray_language` перестраивает меню.
+- Команды: `load_settings`, `set_language(app, language)`. В `tray.rs` трей создаётся с
+  `.with_id("main")` (не `.id()`), `update_tray_language` находит его через `tray_by_id("main")`.
+- Фронтенд: `src/lib/i18n.ts` (словари ru/en, `translate`, `pluralFiles`, тип `TKey`),
+  `src/lib/i18n-react.tsx` (`LangProvider`, `useT`). `App.tsx` обёрнут в `LangProvider`,
+  все строки через `t(...)`; `JobEditor` — через `useT`. Переключатель языка в «Настройках».
+- Файл данных остаётся `backup-jobs.json` (задачи/журнал), язык — отдельно в `settings.json`.

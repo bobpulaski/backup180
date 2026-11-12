@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { HardDrive, Play, Plus, Trash2, Loader2, RefreshCw, Sun, Moon, Folder, ScrollText, ChevronDown, ChevronRight, Settings } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
 import { applyTheme, getInitialTheme, type Theme } from './lib/theme'
+import { formatBytes, pluralFiles, translate, type Lang, type TKey } from './lib/i18n'
+import { LangProvider } from './lib/i18n-react'
 import {
   clearLogs,
   deleteJob,
@@ -12,6 +14,8 @@ import {
   runBackupJob,
   saveJob,
   setAutostart,
+  loadSettings,
+  setLanguage,
 } from './api'
 import type { BackupRunResult, Job, LogEntry, SaveJobPayload } from './types'
 import JobEditor from './components/JobEditor'
@@ -29,41 +33,20 @@ import {
 } from './components/ui/dialog'
 import { Card, CardContent } from './components/ui/card'
 
-function pluralFiles(n: number): string {
-  const mod10 = n % 10
-  const mod100 = n % 100
-  if (mod10 === 1 && mod100 !== 11) return 'файл'
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'файла'
-  return 'файлов'
-}
-
-/** Translate the backend status string (e.g. "ok: 3 files" / "error: …") to Russian. */
-function statusLabel(status: string): string {
+/** Translate the backend status string (e.g. "ok: 3 files" / "error: …"). */
+function statusLabel(
+  t: (k: TKey, p?: Record<string, string | number>) => string,
+  status: string,
+  lang: Lang,
+): string {
   const ok = status.match(/^ok:\s*(\d+)\s*files?$/i)
   if (ok) {
     const n = Number(ok[1])
-    return `Успешно: ${n} ${pluralFiles(n)}`
+    return t('status.ok', { n, word: pluralFiles(n, lang) })
   }
   const err = status.match(/^error:\s*(.*)$/is)
-  if (err) return `Ошибка: ${err[1]}`
+  if (err) return t('status.error', { msg: err[1] })
   return status
-}
-
-function logKindLabel(kind: string): string {
-  switch (kind) {
-    case 'created':
-      return 'создано'
-    case 'updated':
-      return 'изменено'
-    case 'deleted':
-      return 'удалено'
-    case 'run_ok':
-      return 'успех'
-    case 'run_error':
-      return 'ошибка'
-    default:
-      return kind
-  }
 }
 
 function logDot(kind: string): string {
@@ -80,34 +63,27 @@ function logBadge(kind: string): string {
   return 'bg-primary/15 text-primary'
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} Б`
-  const units = ['КБ', 'МБ', 'ГБ', 'ТБ']
-  let value = bytes / 1024
-  let i = 0
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024
-    i++
-  }
-  return `${value.toFixed(1)} ${units[i]}`
-}
-
-function scheduleLabel(job: Job): string {
+function scheduleLabel(t: (k: TKey, p?: Record<string, string | number>) => string, job: Job): string {
   const s = job.schedule
-  if (!s) return 'Без расписания'
+  if (!s) return t('sched.none')
   switch (s.kind) {
     case 'every_minutes':
-      return `Каждые ${s.minutes} мин.`
+      return t('sched.everyMinutes', { n: s.minutes })
     case 'hourly':
-      return `Ежечасно в :${String(s.minute).padStart(2, '0')}`
+      return t('sched.hourly', { mm: String(s.minute).padStart(2, '0') })
     case 'daily':
-      return `Ежедневно в ${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`
-    case 'weekly': {
-      const days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
-      return `Еженедельно (${days[s.weekday - 1] ?? '?'}) в ${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`
-    }
+      return t('sched.daily', {
+        hh: String(s.hour).padStart(2, '0'),
+        mm: String(s.minute).padStart(2, '0'),
+      })
+    case 'weekly':
+      return t('sched.weekly', {
+        day: t(`weekday.${s.weekday}` as TKey),
+        hh: String(s.hour).padStart(2, '0'),
+        mm: String(s.minute).padStart(2, '0'),
+      })
     case 'cron':
-      return `Cron: ${s.expression}`
+      return t('sched.cron', { expr: s.expression })
   }
 }
 
@@ -115,11 +91,13 @@ function JobItem({
   job,
   active,
   running,
+  t,
   onSelect,
 }: {
   job: Job
   active: boolean
   running: boolean
+  t: (k: TKey, p?: Record<string, string | number>) => string
   onSelect: () => void
 }) {
   return (
@@ -136,12 +114,14 @@ function JobItem({
           job.enabled ? 'bg-success' : 'bg-muted-foreground/40 ring-1 ring-inset ring-muted-foreground/50'
         }`}
       />
-      <span className="min-w-0 flex-1 truncate font-medium">{job.name || '(без имени)'}</span>
+      <span className="min-w-0 flex-1 truncate font-medium">{job.name || t('job.unnamed')}</span>
       {!job.enabled ? (
-        <span className="shrink-0 truncate text-[10px] text-muted-foreground">отключена</span>
+        <span className="shrink-0 truncate text-[10px] text-muted-foreground">
+          {t('job.disabled')}
+        </span>
       ) : (
         <span className="shrink-0 truncate text-[10px] text-muted-foreground">
-          {scheduleLabel(job)}
+          {scheduleLabel(t, job)}
         </span>
       )}
       {running && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" />}
@@ -160,6 +140,12 @@ export default function App() {
   const [showLog, setShowLog] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [lang, setLangState] = useState<Lang>('ru')
+
+  const t = useMemo(
+    () => (key: TKey, params?: Record<string, string | number>) => translate(lang, key, params),
+    [lang],
+  )
 
   // Delete-confirmation dialog state.
   const [confirmTarget, setConfirmTarget] = useState<Job | null>(null)
@@ -246,6 +232,15 @@ export default function App() {
     applyTheme(next)
   }
 
+  async function changeLanguage(next: Lang) {
+    try {
+      await setLanguage(next)
+      setLangState(next)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const selected = useMemo(
     () => jobs.find((j) => j.id === selectedId) ?? null,
     [jobs, selectedId],
@@ -312,10 +307,20 @@ export default function App() {
     }
   }
 
+  async function refreshSettings() {
+    try {
+      const s = await loadSettings()
+      setLangState(s.language === 'en' ? 'en' : 'ru')
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   useEffect(() => {
     refresh()
     refreshAutostart()
     refreshLogs()
+    refreshSettings()
   }, [])
 
   // Keep the latest handlers in refs so tray listeners never go stale.
@@ -384,11 +389,11 @@ export default function App() {
     }
   }
 
-  // Run every enabled job sequentially (used by the tray "Запустить бэкап" item).
+  // Run every enabled job sequentially (used by the tray "Run backup" item).
   async function runAllEnabled() {
     const targets = jobs.filter((j) => j.enabled)
     if (targets.length === 0) {
-      setError('Нет включённых задач для запуска.')
+      setError(t('editor.errorNoEnabled'))
       return
     }
     setLastResult(null)
@@ -424,6 +429,7 @@ export default function App() {
   const selectedRunning = selected != null && running === selected.id
 
   return (
+    <LangProvider lang={lang}>
     <div className="flex h-screen w-full flex-col overflow-hidden">
       {/* Top bar */}
       <header className="flex flex-wrap items-center justify-between gap-3 border-b bg-card px-5 py-3">
@@ -433,7 +439,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-base font-semibold leading-tight">Backup180</h1>
-            <p className="text-xs text-muted-foreground">Резервное копирование файлов и папок</p>
+            <p className="text-xs text-muted-foreground">{t('app.subtitle')}</p>
           </div>
         </div>
         <div className="flex items-center gap-4">
@@ -441,7 +447,7 @@ export default function App() {
             variant="ghost"
             size="icon"
             onClick={toggleTheme}
-            title={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'}
+            title={theme === 'dark' ? t('theme.toLight') : t('theme.toDark')}
           >
             {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
           </Button>
@@ -454,7 +460,7 @@ export default function App() {
             }}
           >
             <Plus className="h-4 w-4" />
-            Новая задача
+            {t('job.new')}
           </Button>
         </div>
       </header>
@@ -467,7 +473,7 @@ export default function App() {
         >
           <RefreshCw className="h-3.5 w-3.5 shrink-0" />
           <span className="flex-1">{error}</span>
-          <span className="opacity-70">нажмите, чтобы скрыть</span>
+          <span className="opacity-70">{t('banner.hideHint')}</span>
         </button>
       )}
       {lastResult && (
@@ -476,11 +482,15 @@ export default function App() {
           onClick={() => setLastResult(null)}
         >
           <span className="flex-1">
-            «{lastResult.job_name}»: скопировано {lastResult.files_copied} файлов (
-            {formatBytes(lastResult.bytes_copied)})
-            {lastResult.errors.length > 0 && `, ошибок: ${lastResult.errors.length}`}
+            {t('banner.result', {
+              name: lastResult.job_name,
+              files: `${lastResult.files_copied} ${pluralFiles(lastResult.files_copied, lang)}`,
+              bytes: formatBytes(lastResult.bytes_copied, lang),
+            })}
+            {lastResult.errors.length > 0 &&
+              t('banner.resultErrors', { n: lastResult.errors.length })}
           </span>
-          <span className="opacity-70">скрыть</span>
+          <span className="opacity-70">{t('banner.hide')}</span>
         </button>
       )}
 
@@ -490,7 +500,7 @@ export default function App() {
           <aside className="flex w-14 shrink-0 flex-col items-center gap-1 border-r bg-card/50 py-3">
             <button
               className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-              title="Задачи"
+              title={t('nav.tasks')}
               onClick={() => {
                 setSidebarCollapsed(false)
                 setJobsOpen(true)
@@ -502,7 +512,7 @@ export default function App() {
               className={`relative flex h-9 w-9 items-center justify-center rounded-lg transition-colors hover:bg-accent hover:text-accent-foreground ${
                 showLog ? 'bg-accent text-accent-foreground' : 'text-muted-foreground'
               }`}
-              title="Журнал"
+              title={t('nav.journal')}
               onClick={() => {
                 setShowLog(true)
                 setCreating(false)
@@ -522,7 +532,7 @@ export default function App() {
               className={`flex h-9 w-9 items-center justify-center rounded-lg transition-colors hover:bg-accent hover:text-accent-foreground ${
                 showSettings ? 'bg-accent text-accent-foreground' : 'text-muted-foreground'
               }`}
-              title="Настройки"
+              title={t('nav.settings')}
               onClick={() => {
                 setShowSettings(true)
                 setShowLog(false)
@@ -539,25 +549,25 @@ export default function App() {
               style={{ width: sidebarWidth }}
               className="flex shrink-0 flex-col overflow-y-auto border-r bg-card/50 p-2"
             >
-              {/* "Задачи" group header: chevron toggles, + adds on hover */}
+              {/* "Tasks" group header: chevron toggles, + adds on hover */}
               <div className="group relative mb-1">
                 <button
                   className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-accent/60"
                   onClick={() => setJobsOpen((v) => !v)}
-                  title={jobsOpen ? 'Свернуть задачи' : 'Развернуть задачи'}
+                  title={jobsOpen ? t('tasks.collapse') : t('tasks.expand')}
                 >
                   {jobsOpen ? (
                     <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
                   ) : (
                     <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
                   )}
-                  <span className="flex-1 truncate font-medium">Задачи</span>
+                  <span className="flex-1 truncate font-medium">{t('nav.tasks')}</span>
                 </button>
                 <Button
                   variant="ghost"
                   size="icon"
                   className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100"
-                  title="Новая задача"
+                  title={t('job.new')}
                   onClick={() => {
                     setCreating(true)
                     setSelectedId(null)
@@ -573,7 +583,7 @@ export default function App() {
                 <>
                   {jobs.length === 0 && (
                     <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-                      Пока нет задач
+                      {t('tasks.empty')}
                     </p>
                   )}
                   <div className="space-y-1">
@@ -583,6 +593,7 @@ export default function App() {
                         job={job}
                         active={job.id === selectedId && !showLog}
                         running={running === job.id}
+                        t={t}
                         onSelect={() => {
                           setSelectedId(job.id)
                           setCreating(false)
@@ -607,7 +618,7 @@ export default function App() {
                             <button
                               className="flex min-w-0 flex-1 items-center gap-2 transition-colors hover:text-foreground"
                               onClick={() => toggleGroup(groupName)}
-                              title={open ? 'Свернуть папку' : 'Развернуть папку'}
+                              title={open ? t('folder.collapse') : t('folder.expand')}
                             >
                               {open ? (
                                 <ChevronDown className="h-4 w-4 shrink-0" />
@@ -632,6 +643,7 @@ export default function App() {
                                   job={job}
                                   active={job.id === selectedId && !showLog}
                                   running={running === job.id}
+                                  t={t}
                                   onSelect={() => {
                                     setSelectedId(job.id)
                                     setCreating(false)
@@ -649,7 +661,7 @@ export default function App() {
                 </>
               )}
 
-              {/* Journal entry */}
+              {/* Journal / Settings entries */}
               <div className="mt-4 border-t pt-2">
                 <button
                   className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors ${
@@ -665,7 +677,7 @@ export default function App() {
                     refreshLogs()
                   }}
                 >
-                  <span className="flex-1 font-medium">Журнал</span>
+                  <span className="flex-1 font-medium">{t('nav.journal')}</span>
                   {logs.length > 0 && (
                     <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
                       {logs.length}
@@ -685,7 +697,7 @@ export default function App() {
                     setSelectedId(null)
                   }}
                 >
-                  <span className="flex-1 font-medium">Настройки</span>
+                  <span className="flex-1 font-medium">{t('nav.settings')}</span>
                 </button>
               </div>
             </aside>
@@ -707,17 +719,17 @@ export default function App() {
             <div className="w-full">
               <div className="mb-4 flex items-center gap-2">
                 <Settings className="h-5 w-5 text-primary" />
-                <h2 className="text-lg font-semibold">Настройки</h2>
+                <h2 className="text-lg font-semibold">{t('settings.title')}</h2>
               </div>
               <div className="max-w-2xl space-y-4">
                 <Card>
                   <CardContent className="flex items-center justify-between gap-4 pt-6">
                     <div className="min-w-0">
                       <Label htmlFor="settings-autostart" className="text-sm font-medium">
-                        Автозапуск
+                        {t('settings.autostart')}
                       </Label>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        Запускать Backup180 автоматически при входе в систему.
+                        {t('settings.autostartHint')}
                       </p>
                     </div>
                     <Switch
@@ -727,6 +739,33 @@ export default function App() {
                     />
                   </CardContent>
                 </Card>
+
+                <Card>
+                  <CardContent className="flex items-center justify-between gap-4 pt-6">
+                    <div className="min-w-0">
+                      <Label className="text-sm font-medium">{t('settings.language')}</Label>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t('settings.languageHint')}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        variant={lang === 'ru' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => changeLanguage('ru')}
+                      >
+                        Русский
+                      </Button>
+                      <Button
+                        variant={lang === 'en' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => changeLanguage('en')}
+                      >
+                        English
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
               </div>
             </div>
           ) : showLog ? (
@@ -734,7 +773,7 @@ export default function App() {
               <div className="mb-4 flex items-center justify-between">
                 <h2 className="flex items-center gap-2 text-lg font-semibold">
                   <ScrollText className="h-5 w-5 text-primary" />
-                  Журнал
+                  {t('journal.title')}
                 </h2>
                 <Button
                   variant="outline"
@@ -743,12 +782,12 @@ export default function App() {
                   onClick={() => setConfirmClear(true)}
                 >
                   <Trash2 className="h-4 w-4" />
-                  Очистить
+                  {t('journal.clear')}
                 </Button>
               </div>
               {logs.length === 0 ? (
                 <div className="flex flex-1 items-center justify-center py-20 text-sm text-muted-foreground">
-                  Журнал пуст.
+                  {t('journal.empty')}
                 </div>
               ) : (
                 <ul className="space-y-1.5">
@@ -765,7 +804,7 @@ export default function App() {
                         </div>
                       </div>
                       <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-xs ${logBadge(entry.kind)}`}>
-                        {logKindLabel(entry.kind)}
+                        {t(`kind.${entry.kind}` as TKey)}
                       </span>
                     </li>
                   ))}
@@ -786,7 +825,7 @@ export default function App() {
             />
           ) : (
             <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-              Выберите задачу слева или создайте новую.
+              {t('content.placeholder')}
             </div>
           )}
 
@@ -802,32 +841,32 @@ export default function App() {
                   {selectedRunning ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      Выполняется…
+                      {t('run.running')}
                     </>
                   ) : (
                     <>
                       <Play className="h-4 w-4" />
-                      Запустить сейчас
+                      {t('run.now')}
                     </>
                   )}
                 </Button>
 
                 {selectedRunning ? (
-                  <Button variant="destructive" disabled title="Нельзя удалить выполняющуюся задачу">
+                  <Button variant="destructive" disabled title={t('run.cannotDelete')}>
                     <Trash2 className="h-4 w-4" />
-                    Удалить задачу
+                    {t('run.deleteJob')}
                   </Button>
                 ) : (
                   <Button variant="destructive" onClick={() => requestDelete(selected)}>
                     <Trash2 className="h-4 w-4" />
-                    Удалить задачу
+                    {t('run.deleteJob')}
                   </Button>
                 )}
 
                 <span className="text-xs text-muted-foreground">
-                  Последний запуск:{' '}
+                  {t('run.last')}{' '}
                   {selected.last_run ? new Date(selected.last_run).toLocaleString() : '—'}
-                  {selected.last_status ? ` · ${statusLabel(selected.last_status)}` : ''}
+                  {selected.last_status ? ` · ${statusLabel(t, selected.last_status, lang)}` : ''}
                 </span>
               </div>
             </>
@@ -839,19 +878,18 @@ export default function App() {
       <Dialog open={confirmTarget != null} onOpenChange={(open) => !open && setConfirmTarget(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Удалить задачу?</DialogTitle>
+            <DialogTitle>{t('delete.title')}</DialogTitle>
             <DialogDescription>
-              Задача «{confirmTarget?.name || '(без имени)'}» будет удалена. Это действие нельзя
-              отменить.
+              {t('delete.desc', { name: confirmTarget?.name || t('job.unnamed') })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirmTarget(null)} disabled={deleting}>
-              Отмена
+              {t('common.cancel')}
             </Button>
             <Button variant="destructive" onClick={confirmDelete} disabled={deleting}>
               {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-              Удалить
+              {t('common.delete')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -861,22 +899,21 @@ export default function App() {
       <Dialog open={confirmClear} onOpenChange={(open) => !open && setConfirmClear(false)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Очистить журнал?</DialogTitle>
-            <DialogDescription>
-              Все записи журнала будут удалены. Это действие нельзя отменить.
-            </DialogDescription>
+            <DialogTitle>{t('clear.title')}</DialogTitle>
+            <DialogDescription>{t('clear.desc')}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirmClear(false)} disabled={clearing}>
-              Отмена
+              {t('common.cancel')}
             </Button>
             <Button variant="destructive" onClick={handleClearLogs} disabled={clearing}>
               {clearing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-              Очистить
+              {t('journal.clear')}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
+    </LangProvider>
   )
 }
