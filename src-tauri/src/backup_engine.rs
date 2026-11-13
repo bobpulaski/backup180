@@ -5,6 +5,7 @@ use crate::errors::{AppError, AppResult};
 use glob::Pattern;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
 /// Result of a single backup run.
@@ -17,6 +18,8 @@ pub struct BackupResult {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub errors: Vec<String>,
+    /// True if the run was cancelled by the user before completion.
+    pub cancelled: bool,
 }
 
 /// Normalize a path to a forward-slash string (glob crate uses `/`).
@@ -92,19 +95,30 @@ fn copy_file(source: &Path, dest: &Path) -> AppResult<u64> {
     Ok(copied as u64)
 }
 
-/// Run a backup job.
+/// Run a backup job (uncancellable convenience wrapper).
 pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
+    let cancel = AtomicBool::new(false);
+    run_backup_cancellable(job, &cancel)
+}
+
+/// Run a backup job, aborting early if `cancel` becomes true.
+pub fn run_backup_cancellable(job: &BackupJob, cancel: &AtomicBool) -> AppResult<BackupResult> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut files_copied: u64 = 0;
     let mut bytes_copied: u64 = 0;
     let mut errors: Vec<String> = Vec::new();
+    let mut cancelled = false;
 
     // Validate output directory.
     if !job.output_path.exists() {
         fs::create_dir_all(&job.output_path)?;
     }
 
-    for source in &job.source_paths {
+    'sources: for source in &job.source_paths {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
         if !source.exists() {
             errors.push(format!("Source does not exist: {:?}", source));
             continue;
@@ -133,6 +147,10 @@ pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
             .into_iter()
             .filter_entry(|e| !(e.file_type().is_dir() && dir_excluded(e.path(), &root, job)))
         {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break 'sources;
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -177,6 +195,7 @@ pub fn run_backup(job: &BackupJob) -> AppResult<BackupResult> {
         files_copied,
         bytes_copied,
         errors,
+        cancelled,
     })
 }
 

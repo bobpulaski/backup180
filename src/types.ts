@@ -41,6 +41,7 @@ export interface BackupRunResult {
   files_copied: number
   bytes_copied: number
   errors: string[]
+  cancelled: boolean
 }
 
 export interface LogEntry {

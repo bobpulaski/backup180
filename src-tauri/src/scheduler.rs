@@ -149,6 +149,8 @@ impl Scheduler {
             let job_for_run = job.clone();
             let result = tokio::task::spawn_blocking(move || run_backup(&job_for_run)).await;
 
+            let mut run_files: u64 = 0;
+            let mut run_bytes: u64 = 0;
             match result {
                 Ok(Ok(res)) => {
                     tracing::info!(
@@ -157,6 +159,8 @@ impl Scheduler {
                         res.files_copied,
                         res.bytes_copied
                     );
+                    run_files = res.files_copied;
+                    run_bytes = res.bytes_copied;
                     job.last_run = Some(res.finished_at.clone());
                     job.last_status = Some(format!("ok: {} files", res.files_copied));
                 }
@@ -202,6 +206,36 @@ impl Scheduler {
                 if let Err(e) = crate::config::save_config(&app_handle, &cfg) {
                     tracing::error!("Failed to persist job status: {}", e);
                 }
+            }
+
+            // Notify the user about the scheduled run result.
+            {
+                use tauri_plugin_notification::NotificationExt;
+                let lang = crate::i18n::current_lang();
+                let (title, body) = match &job.last_status {
+                    Some(s) if s.starts_with("ok:") => (
+                        crate::i18n::notif_done_title(lang),
+                        crate::i18n::notif_done_body(lang, &job.name, run_files, run_bytes),
+                    ),
+                    Some(s) => (
+                        crate::i18n::notif_done_title(lang),
+                        crate::i18n::notif_error_body(
+                            lang,
+                            &job.name,
+                            s.trim_start_matches("error: ").trim(),
+                        ),
+                    ),
+                    None => (
+                        crate::i18n::notif_done_title(lang),
+                        crate::i18n::notif_done_body(lang, &job.name, run_files, run_bytes),
+                    ),
+                };
+                let _ = app_handle
+                    .notification()
+                    .builder()
+                    .title(title)
+                    .body(body)
+                    .show();
             }
 
             // Re-read job in case config changed externally (e.g. schedule edit).

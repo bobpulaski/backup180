@@ -20,6 +20,7 @@ pub fn run() {
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -70,6 +71,7 @@ pub fn run() {
             commands::load_logs,
             commands::clear_logs,
             commands::run_backup_job,
+            commands::cancel_backup_job,
             commands::select_folder,
             commands::select_file,
             commands::save_folder,

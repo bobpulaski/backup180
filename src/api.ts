@@ -17,6 +17,8 @@ export const deleteJob = (id: string) => invoke<void>('delete_job', { id })
 
 export const runBackupJob = (id: string) => invoke<BackupRunResult>('run_backup_job', { id })
 
+export const cancelBackupJob = (id: string) => invoke<void>('cancel_backup_job', { id })
+
 export const selectFolder = () => invoke<string | null>('select_folder')
 
 export const selectFile = () => invoke<string | null>('select_file')

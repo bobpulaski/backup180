@@ -3,7 +3,7 @@
 
 use crate::{
     autostart::{disable_autostart, enable_autostart, is_autostart_enabled},
-    backup_engine::run_backup,
+    backup_engine::run_backup_cancellable,
     config::{push_log, save_config, AppConfig, BackupJob, LogEntry, Schedule},
     errors::{AppError, AppResult},
     i18n::{self, Lang},
@@ -11,10 +11,13 @@ use crate::{
     settings::AppSettings,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_notification::NotificationExt;
 
 // ---------------------------------------------------------------------------
 // State
@@ -23,6 +26,8 @@ use tauri_plugin_dialog::DialogExt;
 pub struct AppState {
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
     pub scheduler: tokio::sync::Mutex<Option<Scheduler>>,
+    /// Cancel flags for currently running jobs, keyed by job id.
+    pub cancels: tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -30,6 +35,30 @@ impl AppState {
         Self {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             scheduler: tokio::sync::Mutex::new(None),
+            cancels: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a cancel flag for a running job and return it.
+    pub async fn begin_run(&self, id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().await.insert(id.to_string(), flag.clone());
+        flag
+    }
+
+    /// Remove the cancel flag for a finished job.
+    pub async fn end_run(&self, id: &str) {
+        self.cancels.lock().await.remove(id);
+    }
+
+    /// Signal cancellation for a running job. Returns true if it was running.
+    pub async fn cancel_run(&self, id: &str) -> bool {
+        let flag = self.cancels.lock().await.get(id).cloned();
+        if let Some(f) = flag {
+            f.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 }
@@ -101,6 +130,7 @@ pub struct BackupRunResult {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub errors: Vec<String>,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,25 +289,61 @@ pub async fn run_backup_job(
             .ok_or_else(|| AppError::Config(format!("Job {} not found", id)))?
     };
 
+    let cancel = state.begin_run(&id).await;
+    let cancel_for_run = cancel.clone();
     let job_for_run = job.clone();
-    let finished = tokio::task::spawn_blocking(move || run_backup(&job_for_run)).await;
+    let finished =
+        tokio::task::spawn_blocking(move || run_backup_cancellable(&job_for_run, &cancel_for_run))
+            .await;
+    state.end_run(&id).await;
 
     let result = match finished {
         Ok(Ok(res)) => {
             let lang = i18n::current_lang();
-            persist_status(
-                &app,
-                &state.config,
-                &id,
-                Some(res.finished_at.clone()),
-                Some(format!("ok: {} files", res.files_copied)),
-                "run_ok",
-                i18n::run_manual_ok(lang, &res.job_name, res.files_copied, res.bytes_copied),
-            )
-            .await;
+            if res.cancelled {
+                persist_status(
+                    &app,
+                    &state.config,
+                    &id,
+                    Some(res.finished_at.clone()),
+                    Some("cancelled".into()),
+                    "run_cancelled",
+                    i18n::run_cancelled(lang, &res.job_name),
+                )
+                .await;
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title(i18n::notif_done_title(lang))
+                    .body(i18n::notif_cancelled_body(lang, &res.job_name))
+                    .show();
+            } else {
+                persist_status(
+                    &app,
+                    &state.config,
+                    &id,
+                    Some(res.finished_at.clone()),
+                    Some(format!("ok: {} files", res.files_copied)),
+                    "run_ok",
+                    i18n::run_manual_ok(lang, &res.job_name, res.files_copied, res.bytes_copied),
+                )
+                .await;
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title(i18n::notif_done_title(lang))
+                    .body(i18n::notif_done_body(
+                        lang,
+                        &res.job_name,
+                        res.files_copied,
+                        res.bytes_copied,
+                    ))
+                    .show();
+            }
             res
         }
         Ok(Err(e)) => {
+            let lang = i18n::current_lang();
             persist_status(
                 &app,
                 &state.config,
@@ -285,12 +351,19 @@ pub async fn run_backup_job(
                 Some(chrono::Local::now().to_rfc3339()),
                 Some(format!("error: {}", e)),
                 "run_error",
-                i18n::run_manual_error(i18n::current_lang(), &job.name, &e.to_string()),
+                i18n::run_manual_error(lang, &job.name, &e.to_string()),
             )
             .await;
+            let _ = app
+                .notification()
+                .builder()
+                .title(i18n::notif_done_title(lang))
+                .body(i18n::notif_error_body(lang, &job.name, &e.to_string()))
+                .show();
             return Err(e);
         }
         Err(e) => {
+            let lang = i18n::current_lang();
             persist_status(
                 &app,
                 &state.config,
@@ -298,7 +371,7 @@ pub async fn run_backup_job(
                 Some(chrono::Local::now().to_rfc3339()),
                 Some("error: task join failed".into()),
                 "run_error",
-                i18n::run_join_error(i18n::current_lang(), &job.name),
+                i18n::run_join_error(lang, &job.name),
             )
             .await;
             return Err(AppError::from(e));
@@ -313,7 +386,15 @@ pub async fn run_backup_job(
         files_copied: result.files_copied,
         bytes_copied: result.bytes_copied,
         errors: result.errors,
+        cancelled: result.cancelled,
     })
+}
+
+/// Cancel a running backup job.
+#[tauri::command]
+pub async fn cancel_backup_job(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.cancel_run(&id).await;
+    Ok(())
 }
 
 /// Persist a job's last-run metadata into the shared config and on disk.

@@ -140,3 +140,42 @@ pub fn run_sched_ok_generic(l: Lang, name: &str) -> String {
         Lang::En => format!("Task \"{}\" completed on schedule", name),
     }
 }
+
+pub fn run_cancelled(l: Lang, name: &str) -> String {
+    match l {
+        Lang::Ru => format!("Задача «{}» отменена", name),
+        Lang::En => format!("Task \"{}\" cancelled", name),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System-tray / OS notifications
+// ---------------------------------------------------------------------------
+
+pub fn notif_done_title(l: Lang) -> &'static str {
+    match l {
+        Lang::Ru => "Резервное копирование",
+        Lang::En => "Backup",
+    }
+}
+
+pub fn notif_done_body(l: Lang, name: &str, files: u64, bytes: u64) -> String {
+    match l {
+        Lang::Ru => format!("Задача «{}» выполнена: {} файлов, {} байт", name, files, bytes),
+        Lang::En => format!("Task \"{}\" completed: {} files, {} bytes", name, files, bytes),
+    }
+}
+
+pub fn notif_error_body(l: Lang, name: &str, err: &str) -> String {
+    match l {
+        Lang::Ru => format!("Задача «{}»: ошибка — {}", name, err),
+        Lang::En => format!("Task \"{}\": error — {}", name, err),
+    }
+}
+
+pub fn notif_cancelled_body(l: Lang, name: &str) -> String {
+    match l {
+        Lang::Ru => format!("Задача «{}» отменена", name),
+        Lang::En => format!("Task \"{}\" cancelled", name),
+    }
+}

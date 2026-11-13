@@ -134,3 +134,17 @@ npm run tauri build
   `src/lib/i18n-react.tsx` (`LangProvider`, `useT`). `App.tsx` обёрнут в `LangProvider`,
   все строки через `t(...)`; `JobEditor` — через `useT`. Переключатель языка в «Настройках».
 - Файл данных остаётся `backup-jobs.json` (задачи/журнал), язык — отдельно в `settings.json`.
+
+### Уведомления и отмена задач
+
+- Плагин `tauri-plugin-notification` (+ permission `notification:default`). Уведомления в
+  системном трее по завершении задачи: из `run_backup_job` (ручной запуск) и `scheduler.rs`
+  (по расписанию). Строки — `i18n::notif_done_title/notif_done_body/notif_error_body/notif_cancelled_body`.
+- Отмена: `backup_engine::run_backup_cancellable(job, &AtomicBool)` (обёртка над `run_backup`),
+  `BackupResult.cancelled`. В `AppState` — `cancels: Mutex<HashMap<String, Arc<AtomicBool>>>`
+  с `begin_run`/`end_run`/`cancel_run`; команда `cancel_backup_job(state, id)`.
+- Фронтенд: `api.cancelBackupJob`; `BackupRunResult.cancelled`; баннер «Изменения сохранены»
+  (`banner.saved`, авто-скрытие 3 с, таймер в `savedTimer` ref); кнопка запуска при выполнении
+  становится **«Отмена»** (`variant="destructive"`, иконка `X`), вызывает `cancelBackupJob`;
+  баннер отмены (янтарный) по `lastResult.cancelled` — `banner.cancelled`; журнал пишет
+  `run_cancelled` (янтарная точка/бейдж через `logDot`/`logBadge`).

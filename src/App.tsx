@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { HardDrive, Play, Plus, Trash2, Loader2, RefreshCw, Sun, Moon, Folder, ScrollText, ChevronDown, ChevronRight, Settings } from 'lucide-react'
+import { HardDrive, Play, Plus, Trash2, Loader2, RefreshCw, Sun, Moon, Folder, ScrollText, ChevronDown, ChevronRight, Settings, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
 import { applyTheme, getInitialTheme, type Theme } from './lib/theme'
 import { formatBytes, pluralFiles, translate, type Lang, type TKey } from './lib/i18n'
@@ -12,6 +12,7 @@ import {
   loadLogs,
   reloadScheduler,
   runBackupJob,
+  cancelBackupJob,
   saveJob,
   setAutostart,
   loadSettings,
@@ -52,6 +53,7 @@ function statusLabel(
 function logDot(kind: string): string {
   if (kind === 'run_error') return 'bg-destructive'
   if (kind === 'run_ok') return 'bg-success'
+  if (kind === 'run_cancelled') return 'bg-amber-500'
   if (kind === 'deleted') return 'bg-muted-foreground/60'
   return 'bg-primary'
 }
@@ -59,6 +61,7 @@ function logDot(kind: string): string {
 function logBadge(kind: string): string {
   if (kind === 'run_error') return 'bg-destructive/15 text-destructive'
   if (kind === 'run_ok') return 'bg-success/15 text-success'
+  if (kind === 'run_cancelled') return 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
   if (kind === 'deleted') return 'bg-muted text-muted-foreground'
   return 'bg-primary/15 text-primary'
 }
@@ -136,6 +139,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState<string | null>(null)
   const [lastResult, setLastResult] = useState<BackupRunResult | null>(null)
+  const [saved, setSaved] = useState(false)
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [creating, setCreating] = useState(false)
   const [showLog, setShowLog] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -339,13 +344,17 @@ export default function App() {
 
   async function handleSave(payload: SaveJobPayload) {
     try {
-      const saved = await saveJob(payload)
+      const result = await saveJob(payload)
       await refresh()
       await refreshLogs()
       await reloadScheduler()
-      setSelectedId(saved.id)
+      setSelectedId(result.id)
       setCreating(false)
       setError(null)
+      // Show a transient "saved" confirmation.
+      setSaved(true)
+      if (savedTimer.current) clearTimeout(savedTimer.current)
+      savedTimer.current = setTimeout(() => setSaved(false), 3000)
     } catch (e) {
       setError(String(e))
     }
@@ -386,6 +395,15 @@ export default function App() {
       setError(String(e))
     } finally {
       setRunning(null)
+    }
+  }
+
+  // Request cancellation of the currently running job.
+  async function handleCancel(id: string) {
+    try {
+      await cancelBackupJob(id)
+    } catch (e) {
+      setError(String(e))
     }
   }
 
@@ -476,18 +494,34 @@ export default function App() {
           <span className="opacity-70">{t('banner.hideHint')}</span>
         </button>
       )}
-      {lastResult && (
+      {saved && (
         <button
           className="flex items-center gap-2 border-b border-success/40 bg-success/15 px-5 py-2 text-left text-xs text-success"
+          onClick={() => setSaved(false)}
+        >
+          <span className="flex-1">{t('banner.saved')}</span>
+          <span className="opacity-70">{t('banner.hide')}</span>
+        </button>
+      )}
+      {lastResult && (
+        <button
+          className={`flex items-center gap-2 border-b px-5 py-2 text-left text-xs ${
+            lastResult.cancelled
+              ? 'border-amber-500/40 bg-amber-500/15 text-amber-600 dark:text-amber-400'
+              : 'border-success/40 bg-success/15 text-success'
+          }`}
           onClick={() => setLastResult(null)}
         >
           <span className="flex-1">
-            {t('banner.result', {
-              name: lastResult.job_name,
-              files: `${lastResult.files_copied} ${pluralFiles(lastResult.files_copied, lang)}`,
-              bytes: formatBytes(lastResult.bytes_copied, lang),
-            })}
-            {lastResult.errors.length > 0 &&
+            {lastResult.cancelled
+              ? t('banner.cancelled', { name: lastResult.job_name })
+              : t('banner.result', {
+                  name: lastResult.job_name,
+                  files: `${lastResult.files_copied} ${pluralFiles(lastResult.files_copied, lang)}`,
+                  bytes: formatBytes(lastResult.bytes_copied, lang),
+                })}
+            {!lastResult.cancelled &&
+              lastResult.errors.length > 0 &&
               t('banner.resultErrors', { n: lastResult.errors.length })}
           </span>
           <span className="opacity-70">{t('banner.hide')}</span>
@@ -833,23 +867,17 @@ export default function App() {
             <>
               <Separator className="my-6" />
               <div className="flex flex-wrap items-center gap-3">
-                <Button
-                  variant="secondary"
-                  disabled={selectedRunning}
-                  onClick={() => handleRun(selected.id)}
-                >
-                  {selectedRunning ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      {t('run.running')}
-                    </>
-                  ) : (
-                    <>
-                      <Play className="h-4 w-4" />
-                      {t('run.now')}
-                    </>
-                  )}
-                </Button>
+                {selectedRunning ? (
+                  <Button variant="destructive" onClick={() => handleCancel(selected.id)}>
+                    <X className="h-4 w-4" />
+                    {t('run.cancel')}
+                  </Button>
+                ) : (
+                  <Button variant="secondary" onClick={() => handleRun(selected.id)}>
+                    <Play className="h-4 w-4" />
+                    {t('run.now')}
+                  </Button>
+                )}
 
                 {selectedRunning ? (
                   <Button variant="destructive" disabled title={t('run.cannotDelete')}>
